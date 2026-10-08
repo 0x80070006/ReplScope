@@ -6,7 +6,7 @@ namespace ReplScope;
 /// <summary>Export CSV commun à l'interface et au mode ligne de commande.</summary>
 public static class CsvExport
 {
-    public const string Header = "DC;Partition;Source;SiteSource;DernierSucces;AgeMinutes;Echecs;Code;Message;Etat";
+    public const string Header = "DC;Partition;Source;SiteSource;DernierSucces;AgeMinutes;Echecs;Code;Message;Etat;USN";
 
     public static string SiteOf(IReadOnlyDictionary<string, DcState> dcs, string dc) =>
         dcs.TryGetValue(dc, out var d) ? d.Site
@@ -16,10 +16,10 @@ public static class CsvExport
         string.Join(';', new[] {
             d.Name, l.Partition, l.SourceDc, SiteOf(dcs, l.SourceDc), l.LastSuccess?.ToString("s") ?? "",
             l.Age?.TotalMinutes.ToString("0", CultureInfo.InvariantCulture) ?? "", l.Failures.ToString(CultureInfo.InvariantCulture),
-            l.ErrorCode.ToString(CultureInfo.InvariantCulture), l.Message, ReplicationService.Evaluate(l, th).ToString() }.Select(Cell));
+            l.ErrorCode.ToString(CultureInfo.InvariantCulture), l.Message, ReplicationService.Evaluate(l, th).ToString(), l.Usn.ToString(CultureInfo.InvariantCulture) }.Select(Cell));
 
     public static string ErrorRow(DcState d) =>
-        string.Join(';', new[] { d.Name, "", "", "", "", "", "", "", d.Error ?? "", Health.Failed.ToString() }.Select(Cell));
+        string.Join(';', new[] { d.Name, "", "", "", "", "", "", "", d.Error ?? "", Health.Failed.ToString(), "" }.Select(Cell));
 
     public static void Write(string path, string content) => File.WriteAllText(path, content, new UTF8Encoding(true));
 

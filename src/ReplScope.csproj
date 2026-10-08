@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ReplScope</AssemblyName>
     <RootNamespace>ReplScope</RootNamespace>
-    <Version>1.3.0</Version>
+    <Version>1.3.1</Version>
     <Product>ReplScope</Product>
     <Description>Moniteur de réplication Active Directory (lecture seule)</Description>
     <ApplicationIcon>Assets\ReplScope.ico</ApplicationIcon>
