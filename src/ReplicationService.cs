@@ -127,7 +127,7 @@ public static partial class ReplicationService
         var res = new List<ReplLink>();
         foreach (ReplicationNeighbor n in dc.GetAllReplicationNeighbors())
             res.Add(new ReplLink(n.PartitionName ?? "", n.SourceServer ?? "", "", n.TransportType.ToString(),
-                n.LastSuccessfulSync, n.LastAttemptedSync, n.ConsecutiveFailureCount, n.LastSyncResult, n.LastSyncMessage ?? ""));
+                n.LastSuccessfulSync, n.LastAttemptedSync, n.ConsecutiveFailureCount, n.LastSyncResult, n.LastSyncMessage ?? "", n.UsnLastObjectChangeSynced));
         return res;
     }
 

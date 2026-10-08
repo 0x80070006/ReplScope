@@ -4,7 +4,7 @@ public enum Health { Pending, Running, Ok, Warning, Failed }
 
 public sealed record ReplLink(
     string Partition, string SourceDc, string SourceSite, string Transport,
-    DateTime? LastSuccess, DateTime? LastAttempt, int Failures, int ErrorCode, string Message)
+    DateTime? LastSuccess, DateTime? LastAttempt, int Failures, int ErrorCode, string Message, long Usn = 0)
 {
     public TimeSpan? Age => LastSuccess is { } t && t.Year > 1700 ? DateTime.Now - t.ToLocalTime() : null;
 }

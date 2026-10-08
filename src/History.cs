@@ -7,11 +7,12 @@ public static class EventKind
     public const string Success = "Réplication réussie";
     public const string Failure = "Échec";
     public const string Recovered = "Rétabli";
+    public const string Changes = "Changements répliqués";
     public const string Warning = "Alerte";
     public const string DcDown = "DC injoignable";
     public const string DcUp = "DC rétabli";
 
-    public static readonly string[] All = { Success, Failure, Recovered, Warning, DcDown, DcUp };
+    public static readonly string[] All = { Changes, Success, Failure, Recovered, Warning, DcDown, DcUp };
 
     public static Health Level(string kind) => kind switch
     {
@@ -28,7 +29,7 @@ public sealed record HistoryEvent(DateTime At, string Kind, string Dc, string Si
 public sealed record ScanSample(DateTime At, int Dcs, int DcsFailed, int Links, int Ok, int Warn, int Fail,
                                 double MaxAgeMin, double DurationSec);
 
-public sealed record LinkSnap(DateTime? LastSuccess, int Failures, int ErrorCode, Health Health);
+public sealed record LinkSnap(DateTime? LastSuccess, int Failures, int ErrorCode, Health Health, long Usn = 0);
 
 public sealed class HistoryData
 {
@@ -113,6 +114,9 @@ public sealed class HistoryStore
                 HistoryEvent Ev(string kind, DateTime at, string detail) =>
                     new(at, kind, dc.Name, dc.Site, l.Partition, l.SourceDc, l.ErrorCode, l.Failures, detail);
 
+                if (prev is not null && prev.Usn > 0 && l.Usn > prev.Usn)
+                    added.Add(Ev(EventKind.Changes, ls?.ToLocalTime() ?? now, $"+{l.Usn - prev.Usn} USN répliqués depuis {l.SourceDc} (USN {l.Usn})"));
+
                 if (prev is not null && ls is { } cur && (prev.LastSuccess is not { } p || cur > p))
                     added.Add(Ev(EventKind.Success, cur.ToLocalTime(), "Synchronisation entrante réussie"));
 
@@ -125,7 +129,7 @@ public sealed class HistoryStore
                 else if (h == Health.Ok && prev is not null && prev.Health is Health.Failed or Health.Warning)
                     added.Add(Ev(EventKind.Recovered, now, "Retour à la normale"));
 
-                d.Last[key] = new LinkSnap(ls, l.Failures, l.ErrorCode, h);
+                d.Last[key] = new LinkSnap(ls, l.Failures, l.ErrorCode, h, l.Usn);
             }
         }
         // Liens disparus (topologie modifiée) : on les oublie pour que le snapshot ne grossisse pas indéfiniment.

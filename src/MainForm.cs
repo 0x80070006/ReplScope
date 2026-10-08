@@ -67,6 +67,7 @@ public sealed class MainForm : Form
             ("Source", 170, HorizontalAlignment.Left), ("Site source", 100, HorizontalAlignment.Left),
             ("Dernier succès", 135, HorizontalAlignment.Left), ("Âge", 70, HorizontalAlignment.Right),
             ("Échecs", 55, HorizontalAlignment.Right), ("Code", 80, HorizontalAlignment.Left),
+            ("USN synchronisé", 105, HorizontalAlignment.Right), ("Δ USN", 70, HorizontalAlignment.Right),
             ("Message", 300, HorizontalAlignment.Left) })
             _list.Columns.Add(new ColumnHeader { Text = t, Width = w, TextAlign = a });
         _list.SmallImageList = _icons;
@@ -99,7 +100,7 @@ public sealed class MainForm : Form
         Controls.Add(menu);
         MainMenuStrip = menu;
 
-        foreach (var m in new[] { "1 min", "5 min", "15 min", "30 min" }) _interval.Items.Add(m);
+        foreach (var m in new[] { "10 s", "30 s", "1 min", "5 min", "15 min", "30 min" }) _interval.Items.Add(m);
         _interval.SelectedIndex = 1;
         _interval.SelectedIndexChanged += (_, _) => SetInterval();
         SetInterval();
@@ -111,6 +112,7 @@ public sealed class MainForm : Form
         _autoTimer.Tick += (_, _) => { if (!_scanning) StartScan(); };
         _uiTimer.Tick += (_, _) => { if (_dirty) { _dirty = false; Rebuild(); } UpdateStatus(); };
         _uiTimer.Start();
+        _chkAuto.Checked = true;            // supervision en continu par défaut (un scan ne démarre jamais s'il y en a déjà un)
         _tree.AfterSelect += (_, _) => { FillList(); RefreshMetrics(); FillHistory(); };
         _filter.TextChanged += (_, _) => { FillList(); FillHistory(); };
         KeyPreview = true;
@@ -326,8 +328,8 @@ public sealed class MainForm : Form
 
     private void SetInterval()
     {
-        int[] mins = { 1, 5, 15, 30 };
-        _autoTimer.Interval = mins[Math.Max(0, _interval.SelectedIndex)] * 60_000;
+        int[] secs = { 10, 30, 60, 300, 900, 1800 };
+        _autoTimer.Interval = secs[Math.Max(0, _interval.SelectedIndex)] * 1000;
     }
 
     // ---------- Scan ----------
@@ -370,6 +372,7 @@ public sealed class MainForm : Form
                 _dirty = true; break;
             case DcFinished f:
                 _running.Remove(f.Dc); _done++;
+                DetectChanges(f.Dc, f.State);
                 _dcs[f.Dc] = f.State;
                 if (_bar.Maximum >= _done) _bar.Value = _done;
                 var ok = f.State.Health != Health.Failed;
@@ -419,6 +422,26 @@ public sealed class MainForm : Form
         _log.SelectionStart = _log.TextLength; _log.SelectionColor = c;
         _log.AppendText($"{DateTime.Now:HH:mm:ss.fff}  {msg}\n");
         _log.ScrollToCaret();
+    }
+
+    // ---------- Détection des changements répliqués (USN) ----------
+    private static readonly TimeSpan ChangeHighlight = TimeSpan.FromMinutes(2);
+    private readonly Dictionary<string, (DateTime At, long Delta)> _changes = new();
+
+    private static string LinkKey(string dc, ReplLink l) => $"{dc}|{l.Partition}|{l.SourceDc}".ToLowerInvariant();
+
+    /// <summary>Compare le USN synchronisé de chaque lien à la collecte précédente : une hausse = des objets ont été répliqués.</summary>
+    private void DetectChanges(string dc, DcState now)
+    {
+        if (!_dcs.TryGetValue(dc, out var old) || old.Links.Count == 0) return;
+        var before = old.Links.ToDictionary(l => LinkKey(dc, l), l => l.Usn);
+        foreach (var l in now.Links)
+        {
+            if (!before.TryGetValue(LinkKey(dc, l), out var u) || u <= 0 || l.Usn <= u) continue;
+            _changes[LinkKey(dc, l)] = (DateTime.Now, l.Usn - u);
+            Log($"Changements répliqués : {dc.Split('.')[0]} ← {l.SourceDc.Split('.')[0]}  {l.Partition}  (+{l.Usn - u} USN)", Color.FromArgb(0, 84, 166));
+            _status.Text = $"Changement détecté : {dc.Split('.')[0]} ← {l.SourceDc.Split('.')[0]} (+{l.Usn - u} USN)";
+        }
     }
 
     // ---------- Tree / List ----------
@@ -521,15 +544,20 @@ public sealed class MainForm : Form
             var it = new ListViewItem(d.Name, (int)h);
             it.SubItems.AddRange(new[] {
                 l.Partition, l.SourceDc, SiteOf(l.SourceDc),
-                l.LastSuccess is { } t && t.Year > 1700 ? t.ToLocalTime().ToString("g") : "—",
-                FormatAge(l.Age), l.Failures.ToString(), l.ErrorCode == 0 ? "0" : "0x" + l.ErrorCode.ToString("X8"), l.Message });
+                l.LastSuccess is { } t && t.Year > 1700 ? t.ToLocalTime().ToString("G") : "—",
+                FormatAge(l.Age), l.Failures.ToString(), l.ErrorCode == 0 ? "0" : "0x" + l.ErrorCode.ToString("X8"),
+                l.Usn > 0 ? l.Usn.ToString("N0") : "—",
+                _changes.TryGetValue(LinkKey(d.Name, l), out var ch) && DateTime.Now - ch.At < ChangeHighlight ? "+" + ch.Delta : "",
+                l.Message });
             if (h == Health.Failed) it.ForeColor = Color.Firebrick; else if (h == Health.Warning) it.ForeColor = Color.DarkGoldenrod;
+            if (_changes.TryGetValue(LinkKey(d.Name, l), out var hl) && DateTime.Now - hl.At < ChangeHighlight)
+            { it.BackColor = Color.FromArgb(222, 236, 252); it.Font = new Font(_list.Font, FontStyle.Bold); }
             _list.Items.Add(it); n++;
         }
         foreach (var d in _dcs.Values.Where(d => d.Error is not null && ScopeHas(d)))
         {
             var it = new ListViewItem(d.Name, (int)Health.Failed) { ForeColor = Color.Firebrick };
-            it.SubItems.AddRange(new[] { "—", "—", "—", "—", "—", "—", "—", d.Error! });
+            it.SubItems.AddRange(new[] { "—", "—", "—", "—", "—", "—", "—", "—", "—", d.Error! });
             _list.Items.Add(it);
         }
         if (_sortCol >= 0) _list.Sort();
