@@ -22,6 +22,18 @@ public sealed class MainForm : Form
     private bool _askedCred;                // une seule proposition automatique par session
     private readonly ToolStripStatusLabel _account = new("") { BorderSides = ToolStripStatusLabelBorderSides.Left };
 
+    // Métriques et historique
+    private readonly HistoryStore _hist = new();
+    private readonly TabControl _tabs = new() { Dock = DockStyle.Fill };
+    private readonly List<(Panel Box, Label Value, Label Sub)> _tiles = new();
+    private readonly ListView _byDc = new() { Dock = DockStyle.Bottom, Height = 170, View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, BackColor = Color.White };
+    private readonly TrendChart _chart = new() { Dock = DockStyle.Fill };
+    private readonly ListView _histList = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, BackColor = Color.White };
+    private readonly ComboBox _histKind = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 170 };
+    private readonly Label _histCount = new() { AutoSize = true };
+    private DateTime _lastScanEnd; private double _lastScanSec;
+    private const int HistoryRows = 5000;
+
     private readonly TreeView _tree = new() { Dock = DockStyle.Fill, HideSelection = false, ShowLines = true, FullRowSelect = true };
     private readonly ListView _list = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, BackColor = Color.White };
     private readonly RichTextBox _log = new() { Dock = DockStyle.Fill, ReadOnly = true, BackColor = Color.White, Font = new Font("Consolas", 9f), BorderStyle = BorderStyle.FixedSingle, MaxLength = 400000 };
@@ -66,8 +78,10 @@ public sealed class MainForm : Form
         statusStrip.Items.AddRange(new ToolStripItem[] { _status, _count, _bar, _account });
         UpdateAccount();
 
+        _hist.Load();
+        BuildTabs();
         var right = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 400 };
-        right.Panel1.Controls.Add(_list);
+        right.Panel1.Controls.Add(_tabs);
         var logBox = new GroupBox { Text = "Journal :", Dock = DockStyle.Fill };
         logBox.Controls.Add(_log);
         _log.Dock = DockStyle.Fill;
@@ -97,12 +111,168 @@ public sealed class MainForm : Form
         _autoTimer.Tick += (_, _) => { if (!_scanning) StartScan(); };
         _uiTimer.Tick += (_, _) => { if (_dirty) { _dirty = false; Rebuild(); } UpdateStatus(); };
         _uiTimer.Start();
-        _tree.AfterSelect += (_, _) => FillList();
-        _filter.TextChanged += (_, _) => FillList();
+        _tree.AfterSelect += (_, _) => { FillList(); RefreshMetrics(); FillHistory(); };
+        _filter.TextChanged += (_, _) => { FillList(); FillHistory(); };
         KeyPreview = true;
         KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) _cts?.Cancel(); if (e.KeyCode == Keys.F5) StartScan(); };
         FormClosing += (_, _) => { _cts?.Cancel(); _uiTimer.Stop(); _autoTimer.Stop(); };
-        Shown += (_, _) => StartScan();
+        Shown += (_, _) => { RefreshMetrics(); FillHistory(); StartScan(); };
+    }
+
+    // ---------- Onglets : liens / métriques / historique ----------
+    private void BuildTabs()
+    {
+        var pLinks = new TabPage("Liens de réplication") { UseVisualStyleBackColor = true };
+        pLinks.Controls.Add(_list);
+
+        // Métriques
+        var pMetrics = new TabPage("Métriques") { UseVisualStyleBackColor = true };
+        var flow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(6), WrapContents = true };
+        foreach (var cap in new[] { "Contrôleurs de domaine", "Liens de réplication", "Liens sains", "Liens en alerte", "Liens en échec",
+                                    "Échecs consécutifs", "Âge max du dernier succès", "Âge moyen", "Temps de réponse moyen", "Dernière collecte", "DC le plus dégradé" })
+            flow.Controls.Add(MakeTile(cap));
+        foreach (var (t, w, a) in new[] { ("DC", 190, HorizontalAlignment.Left), ("Site", 100, HorizontalAlignment.Left), ("État", 70, HorizontalAlignment.Left),
+                                          ("Liens", 55, HorizontalAlignment.Right), ("OK", 45, HorizontalAlignment.Right), ("Alertes", 60, HorizontalAlignment.Right),
+                                          ("Échecs", 60, HorizontalAlignment.Right), ("Âge max", 90, HorizontalAlignment.Right), ("Réponse", 80, HorizontalAlignment.Right) })
+            _byDc.Columns.Add(new ColumnHeader { Text = t, Width = w, TextAlign = a });
+        _byDc.SmallImageList = _icons;
+        var chartBox = new GroupBox { Text = "Tendance par collecte (liens OK / alerte / échec) :", Dock = DockStyle.Fill, Padding = new Padding(6, 4, 6, 6) };
+        chartBox.Controls.Add(_chart);
+        pMetrics.Controls.Add(chartBox);
+        pMetrics.Controls.Add(_byDc);
+        pMetrics.Controls.Add(flow);
+        pMetrics.AutoScroll = true;
+
+        // Historique
+        var pHist = new TabPage("Historique") { UseVisualStyleBackColor = true };
+        var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 32, Padding = new Padding(4, 4, 0, 0) };
+        _histKind.Items.Add("Tous les événements");
+        _histKind.Items.AddRange(EventKind.All);
+        _histKind.SelectedIndex = 0;
+        _histKind.SelectedIndexChanged += (_, _) => FillHistory();
+        var clear = new Button { Text = "Effacer l'historique", AutoSize = true };
+        clear.Click += (_, _) => ClearHistory();
+        bar.Controls.AddRange(new Control[] { new Label { Text = "Type :", AutoSize = true, Margin = new Padding(0, 6, 4, 0) }, _histKind, clear,
+                                              new Label { Text = "  ", AutoSize = true }, _histCount });
+        _histCount.Margin = new Padding(8, 6, 0, 0);
+        foreach (var (t, w, a) in new[] { ("Heure", 130, HorizontalAlignment.Left), ("Type", 140, HorizontalAlignment.Left), ("DC cible", 170, HorizontalAlignment.Left),
+                                          ("Partition", 220, HorizontalAlignment.Left), ("Source", 170, HorizontalAlignment.Left), ("Code", 80, HorizontalAlignment.Left),
+                                          ("Échecs", 55, HorizontalAlignment.Right), ("Détail", 320, HorizontalAlignment.Left) })
+            _histList.Columns.Add(new ColumnHeader { Text = t, Width = w, TextAlign = a });
+        _histList.SmallImageList = _icons;
+        pHist.Controls.Add(_histList);
+        pHist.Controls.Add(bar);
+
+        _tabs.TabPages.AddRange(new[] { pLinks, pMetrics, pHist });
+        _tabs.SelectedIndexChanged += (_, _) => { RefreshMetrics(); FillHistory(); };
+    }
+
+    private Panel MakeTile(string caption)
+    {
+        var box = new Panel { Width = 190, Height = 66, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Margin = new Padding(3) };
+        var cap = new Label { Text = caption, Left = 6, Top = 4, Width = 176, Height = 16, ForeColor = SystemColors.GrayText, AutoEllipsis = true };
+        var val = new Label { Text = "—", Left = 6, Top = 20, Width = 176, Height = 28, Font = new Font("Segoe UI", 15f, FontStyle.Bold), ForeColor = Accent, AutoEllipsis = true };
+        var sub = new Label { Text = "", Left = 6, Top = 48, Width = 176, Height = 15, ForeColor = SystemColors.GrayText, AutoEllipsis = true };
+        box.Controls.AddRange(new Control[] { cap, val, sub });
+        _tiles.Add((box, val, sub));
+        return box;
+    }
+
+    private static readonly Color Green = Color.FromArgb(0, 130, 50), Amber = Color.FromArgb(200, 130, 0), Red = Color.FromArgb(190, 25, 25);
+
+    private void SetTile(int i, string value, string sub = "", Color? color = null)
+    {
+        var (_, v, s) = _tiles[i];
+        v.Text = value; v.ForeColor = color ?? Accent; s.Text = sub;
+    }
+
+    private (List<DcState> Dcs, string? Partition) ScopeDcs()
+    {
+        var tag = _tree.SelectedNode?.Tag as string ?? "F";
+        IEnumerable<DcState> dcs = _dcs.Values;
+        string? part = null;
+        if (tag.StartsWith("S:")) dcs = dcs.Where(d => d.Site == tag[2..]);
+        else if (tag.StartsWith("D:")) dcs = dcs.Where(d => string.Equals(d.Name, tag[2..], StringComparison.OrdinalIgnoreCase));
+        else if (tag.StartsWith("P:")) { var p = tag[2..].Split('|', 2); dcs = dcs.Where(d => string.Equals(d.Name, p[0], StringComparison.OrdinalIgnoreCase)); part = p[1]; }
+        return (dcs.ToList(), part);
+    }
+
+    private void RefreshMetrics()
+    {
+        var (dcs, part) = ScopeDcs();
+        var m = Metrics.Compute(dcs, part, _th);
+        var scope = _tree.SelectedNode?.Text ?? "forêt";
+        SetTile(0, m.Dcs.ToString(), $"{m.DcsOk} OK · {m.DcsWarn} alerte · {m.DcsFailed} échec", m.DcsFailed > 0 ? Red : m.DcsWarn > 0 ? Amber : null);
+        SetTile(1, m.Links.ToString(), $"{m.Partitions} partition(s) — {scope}");
+        SetTile(2, m.Links == 0 ? "—" : $"{m.HealthyPercent:0.#} %", $"{m.LinksOk} sur {m.Links}",
+            m.Links == 0 ? null : m.LinksFail > 0 ? Red : m.LinksWarn > 0 ? Amber : Green);
+        SetTile(3, m.LinksWarn.ToString(), $"> {Metrics.FormatAge(_th.Warn)} sans succès", m.LinksWarn > 0 ? Amber : Green);
+        SetTile(4, m.LinksFail.ToString(), $"erreur ou > {Metrics.FormatAge(_th.Fail)}", m.LinksFail > 0 ? Red : Green);
+        SetTile(5, m.ConsecutiveFailures.ToString(), "somme sur les liens", m.ConsecutiveFailures > 0 ? Red : Green);
+        SetTile(6, Metrics.FormatAge(m.MaxAge), "plus ancien dernier succès", m.MaxAge > _th.Fail ? Red : m.MaxAge > _th.Warn ? Amber : null);
+        SetTile(7, Metrics.FormatAge(m.AvgAge), "moyenne des liens");
+        SetTile(8, m.AvgResponse is { } a ? $"{a.TotalSeconds:0.0} s" : "—", m.MaxResponse is { } x ? $"max {x.TotalSeconds:0.0} s" : "");
+        SetTile(9, _lastScanEnd == default ? "—" : $"{_lastScanSec:0.0} s", _lastScanEnd == default ? "" : _lastScanEnd.ToString("g"));
+        SetTile(10, m.WorstDc is null ? "Aucun" : m.WorstDc.Split('.')[0], m.WorstDc ?? "", m.WorstDc is null ? Green : Red);
+
+        _byDc.BeginUpdate();
+        _byDc.Items.Clear();
+        foreach (var d in dcs.OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            var dm = Metrics.Compute(new[] { d }, part, _th);
+            var it = new ListViewItem(d.Name, (int)d.Health);
+            it.SubItems.AddRange(new[] { d.Site, d.Error is not null ? "Injoignable" : d.Health.ToString() == "Ok" ? "OK" : d.Health switch { Health.Warning => "Alerte", Health.Failed => "Échec", Health.Running => "En cours", _ => "En attente" },
+                dm.Links.ToString(), dm.LinksOk.ToString(), dm.LinksWarn.ToString(), dm.LinksFail.ToString(),
+                Metrics.FormatAge(dm.MaxAge), d.Duration > TimeSpan.Zero ? $"{d.Duration.TotalSeconds:0.0} s" : "—" });
+            if (d.Health == Health.Failed) it.ForeColor = Color.Firebrick; else if (d.Health == Health.Warning) it.ForeColor = Color.DarkGoldenrod;
+            _byDc.Items.Add(it);
+        }
+        _byDc.EndUpdate();
+        _chart.SetSamples(_hist.Data.Samples.Count > 60 ? _hist.Data.Samples.GetRange(_hist.Data.Samples.Count - 60, 60) : _hist.Data.Samples.ToList());
+    }
+
+    private void FillHistory()
+    {
+        var (dcs, part) = ScopeDcs();
+        var names = dcs.Select(d => d.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var kind = _histKind.SelectedIndex > 0 ? (string)_histKind.SelectedItem! : null;
+        var f = _filter.Text.Trim();
+        var rows = _hist.Data.Events
+            .Where(e => (names.Count == 0 || names.Contains(e.Dc)) && (part is null || e.Partition.Length == 0 || e.Partition == part)
+                        && (kind is null || e.Kind == kind)
+                        && (f.Length == 0 || (e.Dc + " " + e.Partition + " " + e.Source + " " + e.Detail).Contains(f, StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(e => e.At).ToList();
+        _histList.BeginUpdate();
+        _histList.Items.Clear();
+        foreach (var e in rows.Take(HistoryRows))
+        {
+            var it = new ListViewItem(e.At.ToString("dd/MM/yyyy HH:mm:ss"), (int)EventKind.Level(e.Kind));
+            it.SubItems.AddRange(new[] { e.Kind, e.Dc, e.Partition, e.Source, e.ErrorCode == 0 ? "0" : "0x" + e.ErrorCode.ToString("X8"), e.Failures.ToString(), e.Detail });
+            var lvl = EventKind.Level(e.Kind);
+            if (lvl == Health.Failed) it.ForeColor = Color.Firebrick; else if (lvl == Health.Warning) it.ForeColor = Color.DarkGoldenrod;
+            _histList.Items.Add(it);
+        }
+        _histList.EndUpdate();
+        _histCount.Text = $"{rows.Count} événement(s)" + (rows.Count > HistoryRows ? $" (les {HistoryRows} plus récents affichés)" : "")
+                          + $" — conservés {HistoryStore.Retention.TotalDays:0} jours";
+    }
+
+    private void ClearHistory()
+    {
+        if (MessageBox.Show(this, "Effacer tout l'historique enregistré sur ce poste ?", "ReplScope", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        _hist.Clear(); RefreshMetrics(); FillHistory();
+    }
+
+    private void ExportHistory()
+    {
+        using var sfd = new SaveFileDialog { Filter = "CSV (*.csv)|*.csv", FileName = $"ReplScope_historique_{DateTime.Now:yyyyMMdd_HHmm}.csv" };
+        if (sfd.ShowDialog(this) != DialogResult.OK) return;
+        var sb = new StringBuilder("Heure;Type;DC;Site;Partition;Source;Code;Echecs;Detail\r\n");
+        foreach (var e in _hist.Data.Events.OrderByDescending(x => x.At))
+            sb.Append(string.Join(';', new[] { e.At.ToString("s"), e.Kind, e.Dc, e.Site, e.Partition, e.Source,
+                e.ErrorCode.ToString(CultureInfo.InvariantCulture), e.Failures.ToString(CultureInfo.InvariantCulture), e.Detail }.Select(CsvExport.Cell))).Append("\r\n");
+        try { CsvExport.Write(sfd.FileName, sb.ToString()); }
+        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Export", MessageBoxButtons.OK, MessageBoxIcon.Error); }
     }
 
     // ---------- UI construction ----------
@@ -110,7 +280,8 @@ public sealed class MainForm : Form
     {
         var ms = new MenuStrip();
         var file = new ToolStripMenuItem("&Fichier");
-        file.DropDownItems.Add("&Exporter en CSV…", null, (_, _) => ExportCsv());
+        file.DropDownItems.Add("&Exporter les liens en CSV…", null, (_, _) => ExportCsv());
+        file.DropDownItems.Add("Exporter l'&historique en CSV…", null, (_, _) => ExportHistory());
         file.DropDownItems.Add(new ToolStripSeparator());
         file.DropDownItems.Add("&Quitter", null, (_, _) => Close());
         var action = new ToolStripMenuItem("&Action");
@@ -211,6 +382,15 @@ public sealed class MainForm : Form
                     done.Error is not null ? Color.Firebrick : Color.Black);
                 _status.Text = done.Error ?? $"Statut au : {DateTime.Now:g}";
                 _dirty = true;
+                if (done.Error is null && !done.Cancelled && _dcs.Count > 0)
+                {
+                    _lastScanEnd = DateTime.Now; _lastScanSec = (_lastScanEnd - _scanStart).TotalSeconds;
+                    var ev = _hist.Record(_dcs.Values.ToList(), _th, _lastScanEnd, _lastScanSec);
+                    _hist.Save();
+                    var bad = ev.Count(x => EventKind.Level(x.Kind) == Health.Failed);
+                    Log($"Historique : {ev.Count} événement(s) enregistré(s)" + (bad > 0 ? $" dont {bad} échec(s)" : ""), bad > 0 ? Color.Firebrick : Color.Black);
+                    FillHistory();
+                }
                 // Proposition automatique : une fois pour la session Windows, puis à chaque refus d'un compte saisi.
                 if (done.NeedsCredentials && (!_askedCred || _cred is not null))
                 {
@@ -289,6 +469,7 @@ public sealed class MainForm : Form
         if (_tree.SelectedNode is null) _tree.SelectedNode = root;
         _tree.EndUpdate();
         FillList();
+        RefreshMetrics();
     }
 
     private IEnumerable<(DcState Dc, ReplLink Link)> Scoped()

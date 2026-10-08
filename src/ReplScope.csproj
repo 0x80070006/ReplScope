@@ -7,9 +7,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ReplScope</AssemblyName>
     <RootNamespace>ReplScope</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Product>ReplScope</Product>
-    <Description>Moniteur de rÃ©plication Active Directory (lecture seule)</Description>
+    <Description>Moniteur de réplication Active Directory (lecture seule)</Description>
     <ApplicationIcon>Assets\ReplScope.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>

@@ -9,6 +9,8 @@ Moniteur de réplication Active Directory moderne, inspiré de `replmon`, pour W
 - **Avancement en direct** : DC découverts immédiatement, état mis à jour au fil des réponses, barre de progression, journal horodaté, bouton Arrêter / Échap.
 - **Arbre** Forêt → Site → DC → partitions, avec l'état le plus dégradé remonté sur les sites.
 - **Colonnes** : source, site source, dernier succès, âge, échecs consécutifs, code d'erreur (hex), message. Tri par colonne, filtre texte.
+- **Onglet Métriques** (selon le nœud sélectionné : forêt, site, DC ou partition) : nombre de DC et leur état, liens sains en %, alertes, échecs, échecs consécutifs, âge max et moyen du dernier succès, temps de réponse des DC, durée de la dernière collecte, DC le plus dégradé, tableau par DC et histogramme de tendance par collecte.
+- **Onglet Historique** : réplications réussies, échecs (avec code d'erreur), passages en alerte, rétablissements, DC injoignables. Filtrable par nœud, type et texte, exportable en CSV. Conservé 30 jours dans `%LOCALAPPDATA%\ReplScope\history.json` (noms de DC, partitions et codes d'erreur uniquement, jamais d'identifiants), effaçable depuis l'onglet.
 - **Seuils d'alerte** réglables, mise à jour automatique (1 à 30 min), export CSV protégé contre l'injection de formules.
 - Parallélisme borné (8 DC), délai de 30 s par DC, instance unique, DPI par moniteur.
 
