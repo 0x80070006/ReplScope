@@ -18,6 +18,9 @@ public sealed class MainForm : Form
     private int _done;
     private readonly HashSet<string> _running = new(StringComparer.OrdinalIgnoreCase);
     private Thresholds _th = Thresholds.Default;
+    private AdCredential? _cred;            // compte alternatif, en mémoire uniquement
+    private bool _askedCred;                // une seule proposition automatique par session
+    private readonly ToolStripStatusLabel _account = new("") { BorderSides = ToolStripStatusLabelBorderSides.Left };
 
     private readonly TreeView _tree = new() { Dock = DockStyle.Fill, HideSelection = false, ShowLines = true, FullRowSelect = true };
     private readonly ListView _list = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, BackColor = Color.White };
@@ -60,7 +63,8 @@ public sealed class MainForm : Form
         var menu = BuildMenu();
         var tool = BuildToolbar();
         var statusStrip = new StatusStrip { SizingGrip = true };
-        statusStrip.Items.AddRange(new ToolStripItem[] { _status, _count, _bar });
+        statusStrip.Items.AddRange(new ToolStripItem[] { _status, _count, _bar, _account });
+        UpdateAccount();
 
         var right = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 400 };
         right.Panel1.Controls.Add(_list);
@@ -113,6 +117,9 @@ public sealed class MainForm : Form
         action.DropDownItems.Add("&Actualiser\tF5", null, (_, _) => StartScan());
         action.DropDownItems.Add("A&rrêter\tÉchap", null, (_, _) => _cts?.Cancel());
         action.DropDownItems.Add("&Seuils d'alerte…", null, (_, _) => EditThresholds());
+        action.DropDownItems.Add(new ToolStripSeparator());
+        action.DropDownItems.Add("Se &connecter en tant que…", null, (_, _) => { if (AskCredentials(ReplicationService.MachineDomain(), null)) StartScan(); });
+        action.DropDownItems.Add("Utiliser le compte de la session &Windows", null, (_, _) => { _cred = null; UpdateAccount(); StartScan(); });
         var help = new ToolStripMenuItem("&?");
         help.DropDownItems.Add("À &propos de ReplScope", null, (_, _) => About());
         ms.Items.AddRange(new ToolStripItem[] { file, action, help });
@@ -170,7 +177,7 @@ public sealed class MainForm : Form
         _btnRefresh.Enabled = false; _btnStop.Enabled = true; _forestBox.Enabled = false;
         _bar.Visible = true; _bar.Style = ProgressBarStyle.Marquee;
         Log("Début de la collecte", Color.Black);
-        _ = ReplicationService.ScanAsync(f.Length == 0 ? null : f, _th, _progress, _cts.Token);
+        _ = ReplicationService.ScanAsync(f.Length == 0 ? null : f, _cred, _th, _progress, _cts.Token);
     }
 
     private void OnEvent(ScanEvent e)
@@ -203,7 +210,18 @@ public sealed class MainForm : Form
                 Log(done.Error is not null ? $"Erreur : {done.Error}" : done.Cancelled ? "Collecte annulée" : "Collecte terminée",
                     done.Error is not null ? Color.Firebrick : Color.Black);
                 _status.Text = done.Error ?? $"Statut au : {DateTime.Now:g}";
-                _dirty = true; break;
+                _dirty = true;
+                // Proposition automatique : une fois pour la session Windows, puis à chaque refus d'un compte saisi.
+                if (done.NeedsCredentials && (!_askedCred || _cred is not null))
+                {
+                    _askedCred = true;
+                    var why = _cred is null
+                        ? $"La session Windows ({Environment.UserDomainName}\\{Environment.UserName}) n'est pas un compte du domaine."
+                        : $"Le compte {_cred.User} a été refusé.";
+                    _cred = null; UpdateAccount();
+                    BeginInvoke(() => { if (AskCredentials(done.MachineDomain, why)) StartScan(); });
+                }
+                break;
         }
     }
 
@@ -338,8 +356,7 @@ public sealed class MainForm : Form
         _count.Text = $"{n} lien(s)";
     }
 
-    private string SiteOf(string dc) =>
-        _dcs.TryGetValue(dc, out var d) ? d.Site : _dcs.Values.FirstOrDefault(x => dc.StartsWith(x.Name.Split('.')[0] + ".", StringComparison.OrdinalIgnoreCase))?.Site ?? "—";
+    private string SiteOf(string dc) => CsvExport.SiteOf(_dcs, dc);
 
     private bool ScopeHas(DcState d)
     {
@@ -375,25 +392,61 @@ public sealed class MainForm : Form
     {
         using var sfd = new SaveFileDialog { Filter = "CSV (*.csv)|*.csv", FileName = $"ReplScope_{DateTime.Now:yyyyMMdd_HHmm}.csv" };
         if (sfd.ShowDialog(this) != DialogResult.OK) return;
-        var sb = new StringBuilder("DC;Partition;Source;SiteSource;DernierSucces;AgeMinutes;Echecs;Code;Message\r\n");
-        foreach (var (d, l) in Scoped())
-            sb.AppendJoin(';', new[] { d.Name, l.Partition, l.SourceDc, SiteOf(l.SourceDc), l.LastSuccess?.ToString("s") ?? "",
-                l.Age?.TotalMinutes.ToString("0", CultureInfo.InvariantCulture) ?? "", l.Failures.ToString(), l.ErrorCode.ToString(), l.Message }.Select(Csv)).AppendLine();
-        try { File.WriteAllText(sfd.FileName, sb.ToString(), new UTF8Encoding(true)); }
+        var sb = new StringBuilder(CsvExport.Header).Append("\r\n");
+        foreach (var (d, l) in Scoped()) sb.Append(CsvExport.Row(_dcs, d, l, _th)).Append("\r\n");
+        try { CsvExport.Write(sfd.FileName, sb.ToString()); }
         catch (Exception ex) { MessageBox.Show(this, ex.Message, "Export", MessageBoxButtons.OK, MessageBoxIcon.Error); }
     }
 
-    // Neutralise l'injection de formules (=, +, -, @, tab, CR) et échappe les séparateurs.
-    private static string Csv(string s)
+    private void UpdateAccount()
     {
-        if (s.Length > 0 && "=+-@\t\r".Contains(s[0])) s = "'" + s;
-        return s.IndexOfAny(new[] { ';', '"', '\n', '\r' }) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s;
+        _account.Text = _cred is null ? $"Compte : {Environment.UserDomainName}\\{Environment.UserName}" : $"Compte : {_cred.User}";
+        _account.ToolTipText = _cred is null ? "Authentification Kerberos de la session Windows" : "Compte alternatif (mémoire uniquement, jamais enregistré)";
+    }
+
+    /// <summary>Demande un compte du domaine. Le mot de passe reste en mémoire et n'est jamais écrit ni journalisé.</summary>
+    private bool AskCredentials(string? domain, string? reason)
+    {
+        using var dlg = new Form
+        {
+            Text = "Se connecter en tant que", FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent,
+            MaximizeBox = false, MinimizeBox = false, ShowInTaskbar = false, ClientSize = new Size(400, reason is null ? 150 : 190), Font = Font
+        };
+        int y = 15;
+        if (reason is not null)
+        {
+            dlg.Controls.Add(new Label { Text = reason + "\nIndiquez un compte du domaine pour interroger les contrôleurs.", Left = 15, Top = y, Width = 370, Height = 40 });
+            y += 45;
+        }
+        var user = new TextBox { Left = 150, Top = y, Width = 230, Text = domain is null ? "" : domain.Split('.')[0].ToUpperInvariant() + "\\" };
+        var pwd = new TextBox { Left = 150, Top = y + 32, Width = 230, UseSystemPasswordChar = true, MaxLength = 256 };
+        var ok = new Button { Text = "OK", Left = 220, Top = y + 72, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Annuler", Left = 305, Top = y + 72, DialogResult = DialogResult.Cancel };
+        dlg.Controls.AddRange(new Control[] {
+            new Label { Text = "Utilisateur (DOMAINE\\nom) :", Left = 15, Top = y + 3, AutoSize = true }, user,
+            new Label { Text = "Mot de passe :", Left = 15, Top = y + 35, AutoSize = true }, pwd, ok, cancel });
+        dlg.AcceptButton = ok; dlg.CancelButton = cancel;
+        dlg.Shown += (_, _) => { user.Focus(); user.SelectionStart = user.TextLength; };
+        if (dlg.ShowDialog(this) != DialogResult.OK) return false;
+        var u = user.Text.Trim();
+        // DOMAINE\nom ou nom@domaine.fqdn, caractères limités (pas d'injection dans le contexte LDAP)
+        if (u.Length is 0 or > 256 || u.IndexOfAny(new[] { '"', '/', '[', ']', ':', ';', '|', '=', ',', '+', '*', '?', '<', '>' }) >= 0
+            || (!u.Contains('\\') && !u.Contains('@')) || u.EndsWith('\\') || pwd.TextLength == 0)
+        {
+            MessageBox.Show(this, "Saisissez un compte au format DOMAINE\\nom ou nom@domaine, et son mot de passe.", "ReplScope", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+        _cred = new AdCredential(u, pwd.Text);
+        pwd.Clear();
+        UpdateAccount();
+        Log($"Compte alternatif : {u}", Color.Black);
+        return true;
     }
 
     private void About()
     {
         var v = Assembly.GetExecutingAssembly().GetName().Version;
-        MessageBox.Show(this, $"ReplScope {v?.ToString(3)}\nMoniteur de réplication Active Directory.\nLecture seule — authentification Kerberos du compte courant.\nWindows Server 2022 / 2025 / 2026.",
+        MessageBox.Show(this, $"ReplScope {v?.ToString(3)}\nMoniteur de réplication Active Directory.\nLecture seule — Kerberos du compte courant, ou compte alternatif conservé en mémoire uniquement.\nWindows Server 2022 / 2025 / 2026.",
             "À propos de ReplScope", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 }

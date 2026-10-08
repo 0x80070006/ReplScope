@@ -18,11 +18,27 @@ public static partial class ReplicationService
     private const int MaxParallel = 8;
     private static readonly TimeSpan DcTimeout = TimeSpan.FromSeconds(30);
 
-    public static async Task ScanAsync(string? forestName, Thresholds th, IProgress<ScanEvent> progress, CancellationToken ct)
+    /// <summary>Domaine DNS de la machine (vide si hors domaine). Ne nécessite aucun contexte de sécurité de domaine.</summary>
+    public static string? MachineDomain()
     {
         try
         {
-            var (forest, dcs) = await Task.Run(() => Discover(forestName), ct);
+            var d = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties().DomainName;
+            return string.IsNullOrWhiteSpace(d) || !IsValidForestName(d) ? null : d;
+        }
+        catch { return null; }
+    }
+
+    private static DirectoryContext Ctx(DirectoryContextType type, string? name, AdCredential? cred) =>
+        cred is null
+            ? (name is null ? new DirectoryContext(type) : new DirectoryContext(type, name))
+            : new DirectoryContext(type, name ?? throw new ArgumentNullException(nameof(name)), cred.User, cred.Password);
+
+    public static async Task ScanAsync(string? forestName, AdCredential? cred, Thresholds th, IProgress<ScanEvent> progress, CancellationToken ct)
+    {
+        try
+        {
+            var (forest, dcs) = await Task.Run(() => Discover(forestName, cred), ct);
             progress.Report(new ForestFound(DateTime.Now, forest));
             progress.Report(new DcsDiscovered(DateTime.Now, dcs));
 
@@ -34,7 +50,7 @@ public static partial class ReplicationService
                 {
                     ct.ThrowIfCancellationRequested();
                     progress.Report(new DcStarted(DateTime.Now, dc.Name));
-                    await QueryDcAsync(dc, th, ct);
+                    await QueryDcAsync(dc, cred, th, ct);
                     progress.Report(new DcFinished(DateTime.Now, dc.Name, dc));
                 }
                 catch (OperationCanceledException) { }
@@ -44,15 +60,35 @@ public static partial class ReplicationService
             progress.Report(new ScanDone(DateTime.Now, ct.IsCancellationRequested, null));
         }
         catch (OperationCanceledException) { progress.Report(new ScanDone(DateTime.Now, true, null)); }
-        catch (Exception ex) { progress.Report(new ScanDone(DateTime.Now, false, ex.Message)); }
+        catch (NoDomainContextException ex) { progress.Report(new ScanDone(DateTime.Now, false, ex.Message, NeedsCredentials: true, MachineDomain: ex.MachineDomain)); }
+        catch (System.Security.Authentication.AuthenticationException ex) { progress.Report(new ScanDone(DateTime.Now, false, "Authentification refusée : " + ex.Message, NeedsCredentials: true, MachineDomain: MachineDomain())); }
+        catch (UnauthorizedAccessException ex) { progress.Report(new ScanDone(DateTime.Now, false, "Accès refusé : " + ex.Message, NeedsCredentials: true, MachineDomain: MachineDomain())); }
+        catch (Exception ex) { progress.Report(new ScanDone(DateTime.Now, false, (ex.InnerException ?? ex).Message)); }
     }
 
-    private static (string, List<DcState>) Discover(string? forestName)
+    private static (string, List<DcState>) Discover(string? forestName, AdCredential? cred)
     {
-        var ctx = string.IsNullOrWhiteSpace(forestName)
-            ? new DirectoryContext(DirectoryContextType.Forest)
-            : new DirectoryContext(DirectoryContextType.Forest, forestName.Trim());
-        using var forest = Forest.GetForest(ctx);
+        var name = string.IsNullOrWhiteSpace(forestName) ? null : forestName.Trim();
+        Forest forest;
+        if (name is null && cred is null)
+        {
+            // Session courante : fonctionne seulement si le compte Windows est un compte du domaine.
+            try { forest = Forest.GetCurrentForest(); }
+            catch (ActiveDirectoryOperationException) { throw new NoDomainContextException(MachineDomain()); }
+        }
+        else
+        {
+            if (name is null)
+            {
+                // Compte alternatif sans forêt saisie : on part du domaine de la machine et on remonte à sa forêt.
+                var md = MachineDomain() ?? throw new NoDomainContextException(null);
+                using var dom = Domain.GetDomain(Ctx(DirectoryContextType.Domain, md, cred));
+                using var f0 = dom.Forest;
+                name = f0.Name;
+            }
+            forest = Forest.GetForest(Ctx(DirectoryContextType.Forest, name, cred));
+        }
+        using var _ = forest;
         var list = new List<DcState>();
         foreach (Domain d in forest.Domains)
         {
@@ -64,10 +100,10 @@ public static partial class ReplicationService
         return (forest.Name, list);
     }
 
-    private static async Task QueryDcAsync(DcState dc, Thresholds th, CancellationToken ct)
+    private static async Task QueryDcAsync(DcState dc, AdCredential? cred, Thresholds th, CancellationToken ct)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var work = Task.Run(() => Fetch(dc.Name));
+        var work = Task.Run(() => Fetch(dc.Name, cred));
         var done = await Task.WhenAny(work, Task.Delay(DcTimeout, ct));
         ct.ThrowIfCancellationRequested();
         sw.Stop();
@@ -85,10 +121,9 @@ public static partial class ReplicationService
         }
     }
 
-    private static List<ReplLink> Fetch(string dcName)
+    private static List<ReplLink> Fetch(string dcName, AdCredential? cred)
     {
-        var ctx = new DirectoryContext(DirectoryContextType.DirectoryServer, dcName);
-        using var dc = DomainController.GetDomainController(ctx);
+        using var dc = DomainController.GetDomainController(Ctx(DirectoryContextType.DirectoryServer, dcName, cred));
         var res = new List<ReplLink>();
         foreach (ReplicationNeighbor n in dc.GetAllReplicationNeighbors())
             res.Add(new ReplLink(n.PartitionName ?? "", n.SourceServer ?? "", "", n.TransportType.ToString(),

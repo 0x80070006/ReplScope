@@ -25,7 +25,20 @@ public sealed record ForestFound(DateTime At, string Forest) : ScanEvent(At);
 public sealed record DcsDiscovered(DateTime At, IReadOnlyList<DcState> Dcs) : ScanEvent(At);
 public sealed record DcStarted(DateTime At, string Dc) : ScanEvent(At);
 public sealed record DcFinished(DateTime At, string Dc, DcState State) : ScanEvent(At);
-public sealed record ScanDone(DateTime At, bool Cancelled, string? Error) : ScanEvent(At);
+public sealed record ScanDone(DateTime At, bool Cancelled, string? Error, bool NeedsCredentials = false, string? MachineDomain = null) : ScanEvent(At);
+
+/// <summary>Compte alternatif, conservé uniquement en mémoire pour la durée de la session.</summary>
+public sealed record AdCredential(string User, string Password)
+{
+    public override string ToString() => User;   // ne jamais exposer le mot de passe (journal, débogueur)
+}
+
+/// <summary>La session Windows n'a pas de contexte de domaine (compte local, machine hors domaine).</summary>
+public sealed class NoDomainContextException(string? machineDomain)
+    : Exception("La session courante n'est pas associée à un domaine Active Directory (compte local ?).")
+{
+    public string? MachineDomain { get; } = machineDomain;
+}
 
 public sealed record Thresholds(TimeSpan Warn, TimeSpan Fail)
 {
