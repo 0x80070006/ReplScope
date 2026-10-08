@@ -23,7 +23,7 @@ public static class EventKind
 }
 
 public sealed record HistoryEvent(DateTime At, string Kind, string Dc, string Site, string Partition, string Source,
-                                  int ErrorCode, int Failures, string Detail);
+                                  int ErrorCode, int Failures, string Detail, long UsnFrom = 0, long UsnTo = 0);
 
 /// <summary>Une collecte complète : sert au graphique de tendance.</summary>
 public sealed record ScanSample(DateTime At, int Dcs, int DcsFailed, int Links, int Ok, int Warn, int Fail,
@@ -111,11 +111,11 @@ public sealed class HistoryStore
                 d.Last.TryGetValue(key, out var prev);
                 var ls = l.LastSuccess is { } t && t.Year > 1700 ? t : (DateTime?)null;
 
-                HistoryEvent Ev(string kind, DateTime at, string detail) =>
-                    new(at, kind, dc.Name, dc.Site, l.Partition, l.SourceDc, l.ErrorCode, l.Failures, detail);
+                HistoryEvent Ev(string kind, DateTime at, string detail, long from = 0, long to = 0) =>
+                    new(at, kind, dc.Name, dc.Site, l.Partition, l.SourceDc, l.ErrorCode, l.Failures, detail, from, to);
 
                 if (prev is not null && prev.Usn > 0 && l.Usn > prev.Usn)
-                    added.Add(Ev(EventKind.Changes, ls?.ToLocalTime() ?? now, $"+{l.Usn - prev.Usn} USN répliqués depuis {l.SourceDc} (USN {l.Usn})"));
+                    added.Add(Ev(EventKind.Changes, ls?.ToLocalTime() ?? now, $"+{l.Usn - prev.Usn} USN répliqués depuis {l.SourceDc} (USN {l.Usn})", prev.Usn + 1, l.Usn));
 
                 if (prev is not null && ls is { } cur && (prev.LastSuccess is not { } p || cur > p))
                     added.Add(Ev(EventKind.Success, cur.ToLocalTime(), "Synchronisation entrante réussie"));

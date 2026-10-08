@@ -124,12 +124,42 @@ public static partial class ReplicationService
     private static List<ReplLink> Fetch(string dcName, AdCredential? cred)
     {
         using var dc = DomainController.GetDomainController(Ctx(DirectoryContextType.DirectoryServer, dcName, cred));
+        // File de réplication : opération en cours et opérations en attente (nécessite des droits de lecture, sinon ignorée).
+        var pending = new List<(string Partition, string Src, string Text)>();
+        try
+        {
+            var info = dc.GetReplicationOperationInformation();
+            if (info.CurrentOperation is { } cur)
+                pending.Add((cur.PartitionName ?? "", ShortName(cur.SourceServer), "En cours : " + OpName(cur.OperationType)));
+            foreach (ReplicationOperation op in info.PendingOperations!)
+                pending.Add((op.PartitionName ?? "", ShortName(op.SourceServer), $"En file d'attente (n° {op.OperationNumber}) : {OpName(op.OperationType)}"));
+        }
+        catch { }
+
         var res = new List<ReplLink>();
         foreach (ReplicationNeighbor n in dc.GetAllReplicationNeighbors())
-            res.Add(new ReplLink(n.PartitionName ?? "", n.SourceServer ?? "", "", n.TransportType.ToString(),
-                n.LastSuccessfulSync, n.LastAttemptedSync, n.ConsecutiveFailureCount, n.LastSyncResult, n.LastSyncMessage ?? "", n.UsnLastObjectChangeSynced));
+        {
+            var part = n.PartitionName ?? ""; var src = n.SourceServer ?? "";
+            var p = pending.FirstOrDefault(x => string.Equals(x.Partition, part, StringComparison.OrdinalIgnoreCase)
+                                                && string.Equals(x.Src, ShortName(src), StringComparison.OrdinalIgnoreCase));
+            res.Add(new ReplLink(part, src, "", n.TransportType.ToString(),
+                n.LastSuccessfulSync, n.LastAttemptedSync, n.ConsecutiveFailureCount, n.LastSyncResult, n.LastSyncMessage ?? "",
+                n.UsnLastObjectChangeSynced, p.Text));
+        }
         return res;
     }
+
+    private static string ShortName(string? s) => (s ?? "").Split('.')[0];
+
+    private static string OpName(ReplicationOperationType t) => t switch
+    {
+        ReplicationOperationType.Sync => "synchronisation",
+        ReplicationOperationType.Add => "ajout de réplica",
+        ReplicationOperationType.Delete => "suppression de réplica",
+        ReplicationOperationType.Modify => "modification",
+        ReplicationOperationType.UpdateReference => "mise à jour de référence",
+        _ => t.ToString()
+    };
 
     public static Health Evaluate(ReplLink l, Thresholds th)
     {

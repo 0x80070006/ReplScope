@@ -7,14 +7,15 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
-        if (args.Length > 0) return Cli(args);
+        bool demo = args.Length == 1 && args[0] == "--demo";
+        if (args.Length > 0 && !demo) return Cli(args);
 
         using var mutex = new Mutex(true, @"Local\ReplScope.SingleInstance", out bool first);
-        if (!first) return 0;
+        if (!first && !demo) return 0;
         Application.ThreadException += (_, e) => Fatal(e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => Fatal(e.ExceptionObject as Exception);
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm());
+        Application.Run(new MainForm(demo));
         return 0;
     }
 

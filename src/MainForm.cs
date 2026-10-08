@@ -33,9 +33,14 @@ public sealed class MainForm : Form
     private readonly Label _histCount = new() { AutoSize = true };
     private DateTime _lastScanEnd; private double _lastScanSec;
     private const int HistoryRows = 5000;
+    private readonly System.Windows.Forms.Timer _animTimer = new() { Interval = 120 };
+    private readonly DetailPane _detail, _histDetail;
+    private bool _animating;
+    private readonly Dictionary<string, (DateTime At, long From, long To)> _lastRange = new();
+    private readonly bool _demo;
 
     private readonly TreeView _tree = new() { Dock = DockStyle.Fill, HideSelection = false, ShowLines = true, FullRowSelect = true };
-    private readonly ListView _list = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, BackColor = Color.White };
+    private readonly BufferedListView _list = new() { OwnerDraw = true, Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, BackColor = Color.White };
     private readonly RichTextBox _log = new() { Dock = DockStyle.Fill, ReadOnly = true, BackColor = Color.White, Font = new Font("Consolas", 9f), BorderStyle = BorderStyle.FixedSingle, MaxLength = 400000 };
     private readonly ToolStripButton _btnRefresh = new("Actualiser") { DisplayStyle = ToolStripItemDisplayStyle.ImageAndText };
     private readonly ToolStripButton _btnStop = new("Arrêter") { Enabled = false };
@@ -50,11 +55,15 @@ public sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _autoTimer = new() { Interval = 60_000 };
     private readonly ImageList _icons = new() { ImageSize = new Size(16, 16), ColorDepth = ColorDepth.Depth32Bit };
 
-    public MainForm()
+    public MainForm(bool demo = false)
     {
+        _demo = demo;
+        _detail = new DetailPane(() => _cred);
+        _histDetail = new DetailPane(() => _cred);
         Text = "ReplScope — Moniteur de réplication Active Directory";
         Font = new Font("Segoe UI", 9f);
-        Size = new Size(1180, 720);
+        var wa = Screen.PrimaryScreen!.WorkingArea;
+        Size = new Size(Math.Min(1280, wa.Width - 40), Math.Min(860, wa.Height - 40));
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = SystemColors.Control;
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
@@ -66,12 +75,18 @@ public sealed class MainForm : Form
             ("DC cible", 170, HorizontalAlignment.Left), ("Partition", 230, HorizontalAlignment.Left),
             ("Source", 170, HorizontalAlignment.Left), ("Site source", 100, HorizontalAlignment.Left),
             ("Dernier succès", 135, HorizontalAlignment.Left), ("Âge", 70, HorizontalAlignment.Right),
+            ("Fraîcheur", 110, HorizontalAlignment.Left), ("Activité", 170, HorizontalAlignment.Left),
             ("Échecs", 55, HorizontalAlignment.Right), ("Code", 80, HorizontalAlignment.Left),
             ("USN synchronisé", 105, HorizontalAlignment.Right), ("Δ USN", 70, HorizontalAlignment.Right),
             ("Message", 300, HorizontalAlignment.Left) })
             _list.Columns.Add(new ColumnHeader { Text = t, Width = w, TextAlign = a });
         _list.SmallImageList = _icons;
         _list.ColumnClick += (_, e) => SortBy(e.Column);
+        _list.DrawColumnHeader += (_, e) => e.DrawDefault = true;
+        _list.DrawItem += (_, e) => { };
+        _list.DrawSubItem += DrawLinkCell;
+        _list.SelectedIndexChanged += (_, _) => UpdateDetail();
+        _animTimer.Tick += (_, _) => AnimateActivity();
 
         var menu = BuildMenu();
         var tool = BuildToolbar();
@@ -101,7 +116,7 @@ public sealed class MainForm : Form
         MainMenuStrip = menu;
 
         foreach (var m in new[] { "10 s", "30 s", "1 min", "5 min", "15 min", "30 min" }) _interval.Items.Add(m);
-        _interval.SelectedIndex = 1;
+        _interval.SelectedIndex = 0;
         _interval.SelectedIndexChanged += (_, _) => SetInterval();
         SetInterval();
 
@@ -118,14 +133,21 @@ public sealed class MainForm : Form
         KeyPreview = true;
         KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) _cts?.Cancel(); if (e.KeyCode == Keys.F5) StartScan(); };
         FormClosing += (_, _) => { _cts?.Cancel(); _uiTimer.Stop(); _autoTimer.Stop(); };
-        Shown += (_, _) => { RefreshMetrics(); FillHistory(); StartScan(); };
+        Shown += (_, _) => { RefreshMetrics(); FillHistory(); if (_demo) LoadDemo(); else StartScan(); };
+        if (_demo) { _chkAuto.Checked = false; _forestBox.Text = "demo.lan"; }
+        _animTimer.Start();
     }
 
     // ---------- Onglets : liens / métriques / historique ----------
     private void BuildTabs()
     {
         var pLinks = new TabPage("Liens de réplication") { UseVisualStyleBackColor = true };
-        pLinks.Controls.Add(_list);
+        var linkSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 220 };
+        linkSplit.Panel1.Controls.Add(_list);
+        var detailBox = new GroupBox { Text = "Détail de ce qui est répliqué (lecture seule) :", Dock = DockStyle.Fill };
+        detailBox.Controls.Add(_detail);
+        linkSplit.Panel2.Controls.Add(detailBox);
+        pLinks.Controls.Add(linkSplit);
 
         // Métriques
         var pMetrics = new TabPage("Métriques") { UseVisualStyleBackColor = true };
@@ -162,8 +184,20 @@ public sealed class MainForm : Form
                                           ("Échecs", 55, HorizontalAlignment.Right), ("Détail", 320, HorizontalAlignment.Left) })
             _histList.Columns.Add(new ColumnHeader { Text = t, Width = w, TextAlign = a });
         _histList.SmallImageList = _icons;
-        pHist.Controls.Add(_histList);
+        var histSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 200 };
+        histSplit.Panel1.Controls.Add(_histList);
+        var histBox = new GroupBox { Text = "Objets répliqués lors de l'événement sélectionné :", Dock = DockStyle.Fill };
+        histBox.Controls.Add(_histDetail);
+        histSplit.Panel2.Controls.Add(histBox);
+        pHist.Controls.Add(histSplit);
         pHist.Controls.Add(bar);
+        _histList.SelectedIndexChanged += (_, _) =>
+        {
+            if (_histList.SelectedItems.Count == 0 || _histList.SelectedItems[0].Tag is not HistoryEvent e) { _histDetail.Clear("Sélectionnez un événement « Changements répliqués » pour voir les objets concernés."); return; }
+            if (e.UsnTo > 0 && e.Partition.Length > 0 && e.Source.Length > 0)
+                _histDetail.ShowRange($"{e.At:G} — {e.Dc.Split('.')[0]} ← {e.Source.Split('.')[0]} — USN {e.UsnFrom:N0}…{e.UsnTo:N0}", e.Source, e.Partition, e.UsnFrom, e.UsnTo);
+            else _histDetail.Clear("Cet événement n'a pas de plage d'objets associée.");
+        };
 
         _tabs.TabPages.AddRange(new[] { pLinks, pMetrics, pHist });
         _tabs.SelectedIndexChanged += (_, _) => { RefreshMetrics(); FillHistory(); };
@@ -248,7 +282,7 @@ public sealed class MainForm : Form
         _histList.Items.Clear();
         foreach (var e in rows.Take(HistoryRows))
         {
-            var it = new ListViewItem(e.At.ToString("dd/MM/yyyy HH:mm:ss"), (int)EventKind.Level(e.Kind));
+            var it = new ListViewItem(e.At.ToString("dd/MM/yyyy HH:mm:ss"), (int)EventKind.Level(e.Kind)) { Tag = e };
             it.SubItems.AddRange(new[] { e.Kind, e.Dc, e.Partition, e.Source, e.ErrorCode == 0 ? "0" : "0x" + e.ErrorCode.ToString("X8"), e.Failures.ToString(), e.Detail });
             var lvl = EventKind.Level(e.Kind);
             if (lvl == Health.Failed) it.ForeColor = Color.Firebrick; else if (lvl == Health.Warning) it.ForeColor = Color.DarkGoldenrod;
@@ -424,6 +458,101 @@ public sealed class MainForm : Form
         _log.ScrollToCaret();
     }
 
+    // ---------- Barres : fraîcheur et activité ----------
+    /// <summary>Kind : 0 = rien, 1 = réplication en cours (file AD), 2 = objets répliqués récemment (fondu sur 2 min).</summary>
+    private (int Kind, double Fraction, string Text) ActivityOf(DcState d, ReplLink l)
+    {
+        if (l.Pending is { Length: > 0 } p) return (1, 0, p);
+        if (_changes.TryGetValue(LinkKey(d.Name, l), out var c) && DateTime.Now - c.At is var el && el < ChangeHighlight)
+            return (2, 1 - el / ChangeHighlight, $"+{c.Delta} USN répliqués");
+        return (0, 0, "");
+    }
+
+    private void DrawLinkCell(object? sender, DrawListViewSubItemEventArgs e)
+    {
+        if (e.ColumnIndex is not (6 or 7) || e.Item?.Tag is not ValueTuple<DcState, ReplLink> v) { e.DrawDefault = true; return; }
+        var (d, l) = v;
+        var g = e.Graphics!;
+        bool sel = e.Item.Selected && _list.Focused;
+        var back = e.Item.BackColor.IsEmpty || e.Item.BackColor == SystemColors.Window ? _list.BackColor : e.Item.BackColor;
+        using (var bg = new SolidBrush(sel ? SystemColors.Highlight : back)) g.FillRectangle(bg, e.Bounds);
+        var r = Rectangle.Inflate(e.Bounds, -3, -3);
+        if (r.Width < 8 || r.Height < 6) return;
+        if (e.ColumnIndex == 6)
+        {
+            var h = ReplicationService.Evaluate(l, _th);
+            var col = h switch { Health.Failed => Red, Health.Warning => Amber, _ => Green };
+            var frac = l.Age is { } a ? Math.Clamp(1 - a.TotalSeconds / _th.Fail.TotalSeconds, 0.04, 1) : 0.04;
+            DrawBar(g, r, frac, col, FormatAge(l.Age));
+            return;
+        }
+        var (kind, f, t) = ActivityOf(d, l);
+        if (kind == 0) return;
+        if (kind == 1)
+        {
+            // Barre indéterminée : un segment parcourt la zone tant que le DC rapporte une opération en file.
+            double ph = (Environment.TickCount64 % 1400) / 1400.0;
+            int w = Math.Max(10, r.Width * 35 / 100);
+            int x = r.Left + (int)((r.Width + w) * ph) - w;
+            DrawBar(g, r, 0, Accent, t);
+            var seg = Rectangle.Intersect(new Rectangle(x, r.Top + 1, w, r.Height - 1), r);
+            if (seg.Width > 0) using (var br = new SolidBrush(Color.FromArgb(150, Accent))) g.FillRectangle(br, seg);
+            return;
+        }
+        DrawBar(g, r, f, Accent, t);
+    }
+
+    private void DrawBar(Graphics g, Rectangle r, double frac, Color col, string text)
+    {
+        using (var back = new SolidBrush(Color.FromArgb(235, 235, 235))) g.FillRectangle(back, r);
+        if (frac > 0) using (var fill = new SolidBrush(col)) g.FillRectangle(fill, r.Left, r.Top, (int)Math.Max(2, r.Width * frac), r.Height);
+        g.DrawRectangle(Pens.Gray, r);
+        TextRenderer.DrawText(g, text, _list.Font, r, Color.Black, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+    }
+
+    private void AnimateActivity()
+    {
+        if (!_animating || _list.Items.Count == 0 || _tabs.SelectedIndex != 0) return;
+        _list.Invalidate();
+        // Fin d'un fondu : on reconstruit la liste pour retirer le surlignage.
+        if (!_list.Items.Cast<ListViewItem>().Any(x => x.Tag is ValueTuple<DcState, ReplLink> v && ActivityOf(v.Item1, v.Item2).Kind != 0))
+        { _animating = false; FillList(); }
+    }
+
+    private void UpdateDetail()
+    {
+        if (_list.SelectedItems.Count == 0 || _list.SelectedItems[0].Tag is not ValueTuple<DcState, ReplLink> v)
+        { _detail.Clear("Sélectionnez un lien pour voir ce qui a été répliqué."); return; }
+        var (d, l) = v;
+        if (_demo || l.Partition.Length == 0 || l.SourceDc.Length == 0) { _detail.Clear(_demo ? "Détail indisponible en mode démonstration." : "Aucun détail pour cette ligne."); return; }
+        var who = $"{d.Name.Split('.')[0]} ← {l.SourceDc.Split('.')[0]} — {l.Partition}";
+        if (_lastRange.TryGetValue(LinkKey(d.Name, l), out var r))
+            _detail.ShowRange($"{who}\nDernière réplication d'objets observée à {r.At:T} — USN {r.From + 1:N0}…{r.To:N0}", l.SourceDc, l.Partition, r.From + 1, r.To);
+        else if (l.Usn > 0)
+            _detail.ShowRange($"{who}\nAucun changement observé depuis l'ouverture : derniers objets déjà répliqués (USN ≤ {l.Usn:N0})", l.SourceDc, l.Partition, Math.Max(1, l.Usn - 199), l.Usn);
+        else _detail.Clear("Pas de USN pour ce lien.");
+    }
+
+    private void LoadDemo()
+    {
+        var now = DateTime.UtcNow;
+        DcState Mk(string n, string src, long usn, int ageS, string? pend, int fails = 0, int code = 0) => new()
+        {
+            Name = n + ".demo.lan", Site = "Default-First-Site-Name", Health = fails > 0 ? Health.Failed : Health.Ok, Duration = TimeSpan.FromSeconds(0.4),
+            Links = new() {
+                new ReplLink("DC=demo,DC=lan", src + ".demo.lan", "", "IP", now.AddSeconds(-ageS), now, fails, code, code == 0 ? "L’opération a réussi." : "Le serveur n’est pas opérationnel", usn, pend),
+                new ReplLink("CN=Configuration,DC=demo,DC=lan", src + ".demo.lan", "", "IP", now.AddMinutes(-14), now, 0, 0, "L’opération a réussi.", usn - 100),
+                new ReplLink("DC=DomainDnsZones,DC=demo,DC=lan", src + ".demo.lan", "", "IP", now.AddMinutes(-90), now, 0, 0, "L’opération a réussi.", usn - 50) }
+        };
+        _forest = "demo.lan";
+        _dcs["dc1.demo.lan"] = Mk("dc1", "dc2", 24880, 40, null);
+        _dcs["dc2.demo.lan"] = Mk("dc2", "dc1", 28916, 3, "En cours : synchronisation");
+        _dcs["dc3.demo.lan"] = Mk("dc3", "dc1", 9000, 7200, null, 3, unchecked((int)0x80090322));
+        _changes["dc1.demo.lan|dc=demo,dc=lan|dc2.demo.lan"] = (DateTime.Now.AddSeconds(-30), 10);
+        _status.Text = "Mode démonstration (données fictives)";
+        Rebuild();
+    }
+
     // ---------- Détection des changements répliqués (USN) ----------
     private static readonly TimeSpan ChangeHighlight = TimeSpan.FromMinutes(2);
     private readonly Dictionary<string, (DateTime At, long Delta)> _changes = new();
@@ -439,6 +568,7 @@ public sealed class MainForm : Form
         {
             if (!before.TryGetValue(LinkKey(dc, l), out var u) || u <= 0 || l.Usn <= u) continue;
             _changes[LinkKey(dc, l)] = (DateTime.Now, l.Usn - u);
+            _lastRange[LinkKey(dc, l)] = (DateTime.Now, u, l.Usn);
             Log($"Changements répliqués : {dc.Split('.')[0]} ← {l.SourceDc.Split('.')[0]}  {l.Partition}  (+{l.Usn - u} USN)", Color.FromArgb(0, 84, 166));
             _status.Text = $"Changement détecté : {dc.Split('.')[0]} ← {l.SourceDc.Split('.')[0]} (+{l.Usn - u} USN)";
         }
@@ -526,7 +656,7 @@ public sealed class MainForm : Form
         public int Compare(object? a, object? b)
         {
             var x = ((ListViewItem)a!).SubItems[col].Text; var y = ((ListViewItem)b!).SubItems[col].Text;
-            int r = double.TryParse(x.Trim('h', 'm', 's', ' '), out var nx) && double.TryParse(y.Trim('h', 'm', 's', ' '), out var ny) && col is 6
+            int r = double.TryParse(x.Trim('h', 'm', 's', ' '), out var nx) && double.TryParse(y.Trim('h', 'm', 's', ' '), out var ny) && col is 8
                 ? nx.CompareTo(ny) : string.Compare(x, y, StringComparison.CurrentCultureIgnoreCase);
             return asc ? r : -r;
         }
@@ -535,17 +665,17 @@ public sealed class MainForm : Form
     private void FillList()
     {
         _list.BeginUpdate();
-        var topKey = _list.TopItem?.Text;
+        string? selKey = _list.SelectedItems.Count > 0 && _list.SelectedItems[0].Tag is ValueTuple<DcState, ReplLink> st ? LinkKey(st.Item1.Name, st.Item2) : null;
         _list.Items.Clear();
         int n = 0;
         foreach (var (d, l) in Scoped())
         {
             var h = ReplicationService.Evaluate(l, _th);
-            var it = new ListViewItem(d.Name, (int)h);
+            var it = new ListViewItem(d.Name, (int)h) { Tag = (d, l) };
             it.SubItems.AddRange(new[] {
                 l.Partition, l.SourceDc, SiteOf(l.SourceDc),
                 l.LastSuccess is { } t && t.Year > 1700 ? t.ToLocalTime().ToString("G") : "—",
-                FormatAge(l.Age), l.Failures.ToString(), l.ErrorCode == 0 ? "0" : "0x" + l.ErrorCode.ToString("X8"),
+                FormatAge(l.Age), "", "", l.Failures.ToString(), l.ErrorCode == 0 ? "0" : "0x" + l.ErrorCode.ToString("X8"),
                 l.Usn > 0 ? l.Usn.ToString("N0") : "—",
                 _changes.TryGetValue(LinkKey(d.Name, l), out var ch) && DateTime.Now - ch.At < ChangeHighlight ? "+" + ch.Delta : "",
                 l.Message });
@@ -557,12 +687,17 @@ public sealed class MainForm : Form
         foreach (var d in _dcs.Values.Where(d => d.Error is not null && ScopeHas(d)))
         {
             var it = new ListViewItem(d.Name, (int)Health.Failed) { ForeColor = Color.Firebrick };
-            it.SubItems.AddRange(new[] { "—", "—", "—", "—", "—", "—", "—", "—", "—", d.Error! });
+            it.SubItems.AddRange(new[] { "—", "—", "—", "—", "—", "—", "—", "—", "—", "—", "—", d.Error! });
             _list.Items.Add(it);
         }
         if (_sortCol >= 0) _list.Sort();
+        if (selKey is not null)
+            foreach (ListViewItem x in _list.Items)
+                if (x.Tag is ValueTuple<DcState, ReplLink> t2 && LinkKey(t2.Item1.Name, t2.Item2) == selKey) { x.Selected = true; break; }
+        _animating = _list.Items.Cast<ListViewItem>().Any(x => x.Tag is ValueTuple<DcState, ReplLink> v && ActivityOf(v.Item1, v.Item2).Kind != 0);
         _list.EndUpdate();
         _count.Text = $"{n} lien(s)";
+        UpdateDetail();
     }
 
     private string SiteOf(string dc) => CsvExport.SiteOf(_dcs, dc);
